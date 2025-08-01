@@ -43,7 +43,7 @@ class NetworkUtils {
 
             val ipAddress = getLocalIpAddress()
 
-            Log.d(TAG, "Network Info - WiFi: $isWifiConnected, Internet: $hasInternet, SSID: '$ssid', IP: $ipAddress")
+            //Log.d(TAG, "Network Info - WiFi: $isWifiConnected, Internet: $hasInternet, SSID: '$ssid', IP: $ipAddress")
 
             return NetworkInfo(
                 isWifiConnected = isWifiConnected,

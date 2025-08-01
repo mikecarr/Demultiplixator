@@ -41,7 +41,7 @@ class UdpDataSource {
                         // Log packet reception periodically (every 100 packets or every 5 seconds)
                         val currentTime = System.currentTimeMillis()
                         if (packetCount % 100 == 0L || (currentTime - lastLogTime) > 5000) {
-                            Log.d(TAG, "Received packet #$packetCount from ${packet.address}:${packet.port}, size: ${packet.length}")
+                            //Log.d(TAG, "Received packet #$packetCount from ${packet.address}:${packet.port}, size: ${packet.length}")
                             lastLogTime = currentTime
                         }
 

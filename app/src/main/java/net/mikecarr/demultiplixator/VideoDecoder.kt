@@ -65,6 +65,7 @@ class VideoDecoder {
     private var ppsData: ByteArray? = null
     private var rtpTimestampBase: Long = 0L
     private var isFirstRecordedFrame = true
+    private var lastPresentationTimeUs: Long = 0L
 
     // --- FPS estimation ---
     private var frameTimestamps = mutableListOf<Long>()
@@ -136,11 +137,21 @@ class VideoDecoder {
 
     fun startRecording(context: Context): Boolean {
         synchronized(lock) {
-            if (isRecording || mediaCodec == null || !isConfigured()) {
-                Log.w(TAG, "Cannot start recording. isRecording=$isRecording, codecReady=${mediaCodec != null}, configured=${isConfigured()}")
+            Log.d(TAG, "startRecording() called.")
+            if (isRecording) {
+                Log.w(TAG, "Cannot start recording: Already recording.")
+                return false
+            }
+            if (mediaCodec == null) {
+                Log.w(TAG, "Cannot start recording: MediaCodec is null.")
+                return false
+            }
+            if (!isConfigured()) {
+                Log.w(TAG, "Cannot start recording: Codec is not configured (missing SPS/PPS/VPS).")
                 return false
             }
             try {
+                Log.d(TAG, "Proceeding to create MediaMuxer.")
                 val fileName = "REC_${SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())}.mp4"
                 val mediaFormat = createMediaFormat()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -159,16 +170,21 @@ class VideoDecoder {
                     val outputFile = File(moviesDir, fileName)
                     mediaMuxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
                 }
+                Log.d(TAG, "MediaMuxer created. Adding track.")
                 videoTrackIndex = mediaMuxer!!.addTrack(mediaFormat)
+                Log.d(TAG, "Track added. Starting MediaMuxer.")
                 mediaMuxer!!.start()
+                Log.d(TAG, "MediaMuxer started successfully.")
                 isRecording = true
                 frameCount = 0L
                 isFirstRecordedFrame = true
                 rtpTimestampBase = 0L
-                Log.d(TAG, "Recording started: $fileName")
+                lastPresentationTimeUs = 0L
+                Log.d(TAG, "Recording state is now ON for file: $fileName")
                 return true
             } catch (e: Exception) {
-                Log.e(TAG, "Error starting recording", e)
+                // Log the specific exception that occurred
+                Log.e(TAG, "CRITICAL: Error starting recording. This is a likely cause of failure.", e)
                 mediaMuxer?.release()
                 mediaMuxer = null
                 return false
@@ -233,17 +249,30 @@ class VideoDecoder {
 
     fun stopRecording() {
         synchronized(lock) {
+            Log.d(TAG, "stopRecording() called. Current recording state: $isRecording")
             if (!isRecording) return
-            isRecording = false
+            isRecording = false // Set state to false immediately to prevent new frames from being written
+            Log.d(TAG, "Recording state is now OFF.")
             try {
-                mediaMuxer?.stop()
-                mediaMuxer?.release()
-                Log.d(TAG, "MediaMuxer stopped/released")
+                if (mediaMuxer != null) {
+                    Log.d(TAG, "Attempting to call mediaMuxer.stop()...")
+                    mediaMuxer?.stop()
+                    Log.d(TAG, "mediaMuxer.stop() completed successfully.")
+
+                    Log.d(TAG, "Attempting to call mediaMuxer.release()...")
+                    // mediaMuxer?.release()
+                    Log.d(TAG, "mediaMuxer.release() completed successfully.")
+                    Log.i(TAG, "File should now be saved and playable.")
+                } else {
+                    Log.w(TAG, "mediaMuxer was null when stopRecording() was called.")
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "Error stopping muxer", e)
+                // This is the most important log message to look for!
+                Log.e(TAG, "CRITICAL: Error during mediaMuxer.stop() or .release(). The file is likely corrupt.", e)
             } finally {
                 mediaMuxer = null
                 videoTrackIndex = -1
+                Log.d(TAG, "Muxer resources set to null.")
             }
         }
     }
@@ -269,9 +298,11 @@ class VideoDecoder {
     }
 
     fun configure(surface: Surface, width: Int, height: Int) = synchronized(lock) {
+        Log.d(TAG, "configure() called for ${width}x${height}.")
         if (mediaCodec != null) {
-            Log.w(TAG, "Configure called on an already configured codec.")
-            return@synchronized
+            Log.w(TAG, "Configure called on an already-configured codec. Releasing first.")
+            // If configure is called again, it means we need a fresh start.
+            release()
         }
         this.surface = surface
         this.width = width
@@ -279,18 +310,24 @@ class VideoDecoder {
         try {
             val mimeType = if (isHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
             val format = MediaFormat.createVideoFormat(mimeType, width, height)
+            Log.d(TAG, "Creating decoder for $mimeType")
             mediaCodec = MediaCodec.createDecoderByType(mimeType).apply {
+                Log.d(TAG, "Calling mediaCodec.configure()")
                 configure(format, surface, null, 0)
+                Log.d(TAG, "Calling mediaCodec.start()")
                 start()
             }
-            Log.d(TAG, "MediaCodec configured and started for $mimeType")
+            Log.i(TAG, "MediaCodec configured and started successfully for $mimeType")
         } catch (e: Exception) {
-            Log.e(TAG, "Error configuring MediaCodec", e)
+            Log.e(TAG, "CRITICAL: Error configuring MediaCodec", e)
+            mediaCodec = null
         }
     }
 
     fun decodeRtpPacket(rtpPacket: ByteArray, length: Int) {
+
         updatePacketStats(rtpPacket)
+
         if (length <= 12) return
 
         // --- FIX: Extract the RTP Timestamp from the packet header ---
@@ -391,7 +428,7 @@ class VideoDecoder {
                 bufferInfo.size = data.size
                 bufferInfo.flags = if (isKeyFrame(data)) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
 
-                val presentationTimeUs = if (rtpTimestamp > 0) {
+                var presentationTimeUs = if (rtpTimestamp > 0) {
                     if (isFirstRecordedFrame) {
                         rtpTimestampBase = rtpTimestamp
                         isFirstRecordedFrame = false
@@ -402,12 +439,22 @@ class VideoDecoder {
                 } else {
                     (frameCount * 1000000L) / getEstimatedFPS()
                 }
+
+                if (presentationTimeUs <= lastPresentationTimeUs) {
+                    presentationTimeUs = lastPresentationTimeUs + 1
+                }
                 bufferInfo.presentationTimeUs = presentationTimeUs
+                lastPresentationTimeUs = presentationTimeUs
+
                 frameCount++
                 try {
+                    // This is where timestamp errors would occur.
                     mediaMuxer?.writeSampleData(videoTrackIndex, ByteBuffer.wrap(data), bufferInfo)
                 } catch (e: Exception) {
-                    if (isRecording) Log.e(TAG, "Muxer write error", e)
+                    // If this happens, the muxer is now in a bad state and stop() will fail.
+                    Log.e(TAG, "CRITICAL: Muxer writeSampleData error. The recording is now likely corrupt.", e)
+                    // We should stop recording to prevent further damage and log the failure.
+                    stopRecording()
                 }
             }
 
@@ -428,7 +475,7 @@ class VideoDecoder {
                             val newFormat = mediaCodec!!.outputFormat
                             val newWidth = newFormat.getInteger("width")
                             val newHeight = newFormat.getInteger("height")
-                            Log.d(TAG, "Decoder detected format change: ${newWidth}x${newHeight}")
+                            Log.d(TAG, "Decoder format change: ${newWidth}x${newHeight}")
                             if (currentStreamWidth != newWidth || currentStreamHeight != newHeight) {
                                 currentStreamWidth = newWidth
                                 currentStreamHeight = newHeight
@@ -439,7 +486,8 @@ class VideoDecoder {
                     outputBufferIndex = mediaCodec!!.dequeueOutputBuffer(bufferInfo, 0)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error during decoding", e)
+                // An error here could indicate a problem with the decoder itself.
+                Log.e(TAG, "Error during mediaCodec decoding loop", e)
             }
         }
     }
@@ -467,15 +515,36 @@ class VideoDecoder {
     }
 
     fun release() = synchronized(lock) {
-        if (mediaCodec == null) return@synchronized
-        stopRecording()
+        Log.d(TAG, "release() called.")
+
+        // First, stop any active recording if it's still running.
+        if (isRecording) {
+            stopRecording()
+        }
+
+        // Now, release the muxer resources.
         try {
-            mediaCodec?.stop()
-            mediaCodec?.release()
+            if (mediaMuxer != null) {
+                Log.d(TAG, "Releasing MediaMuxer resources.")
+                mediaMuxer?.release()
+                mediaMuxer = null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing MediaMuxer", e)
+        }
+
+        // Finally, release the codec resources.
+        try {
+            if (mediaCodec != null) {
+                Log.d(TAG, "Releasing MediaCodec resources.")
+                mediaCodec?.stop()
+                mediaCodec?.release()
+                mediaCodec = null
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing MediaCodec", e)
         }
-        mediaCodec = null
-        Log.d(TAG, "MediaCodec released")
+
+        Log.d(TAG, "All resources have been released.")
     }
 }
